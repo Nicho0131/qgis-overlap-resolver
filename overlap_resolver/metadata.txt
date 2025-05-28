@@ -1,0 +1,16 @@
+[general]
+name=Overlap Resolver
+qgisMinimumVersion=3.0
+description=Resolves overlapping polygons based on datetime attributes
+version=0.1
+author=Your Name
+email=your.email@example.com
+about=This plugin resolves overlapping polygons by keeping the most recent features based on datetime attributes.
+tracker=http://bugs
+repository=http://www.github.com/yourusername/overlap-resolver
+homepage=http://www.github.com/yourusername/overlap-resolver
+category=Vector
+icon=icon.png
+experimental=True
+deprecated=False
+tags=vector,overlap,datetime,resolution 
