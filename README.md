@@ -22,7 +22,7 @@ A QGIS plugin for resolving overlapping polygons in shapefiles, with support for
 4. Click Install
 
 ### Manual Installation
-1. Download the latest release from the [Releases](https://github.com/yourusername/qgis-overlap-resolver/releases) page
+1. Download the latest release from the [Releases](https://github.com/Nicho0131/qgis-overlap-resolver/releases) page
 2. Extract the ZIP file
 3. Copy the `overlap_resolver` folder to your QGIS plugins directory:
    - Windows: `C:\Users\<username>\AppData\Roaming\QGIS\QGIS3\profiles\default\python\plugins\`
@@ -66,7 +66,7 @@ A QGIS plugin for resolving overlapping polygons in shapefiles, with support for
 ### Building from Source
 1. Clone the repository:
    ```bash
-   git clone https://github.com/yourusername/qgis-overlap-resolver.git
+   git clone https://github.com/Nicho0131/qgis-overlap-resolver.git
    ```
 2. Install development dependencies:
    ```bash
@@ -102,10 +102,10 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 If you encounter any issues or have questions, please:
 1. Check the [documentation](docs/)
-2. Search [existing issues](https://github.com/yourusername/qgis-overlap-resolver/issues)
+2. Search [existing issues](https://github.com/Nicho0131/qgis-overlap-resolver/issues)
 3. Create a new issue if needed
 
 ## Acknowledgments
 
 - QGIS Development Team
-- All contributors and users of this plugin 
+- All contributors and users of this plugin
