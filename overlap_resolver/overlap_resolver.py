@@ -1,7 +1,7 @@
-from qgis.PyQt.QtWidgets import QAction, QFileDialog, QMessageBox
+from qgis.PyQt.QtWidgets import QAction, QFileDialog, QMessageBox, QProgressDialog
 from qgis.core import (QgsProject, QgsVectorLayer, QgsFeature, QgsGeometry,
                       QgsWkbTypes, QgsCoordinateReferenceSystem, QgsField, QgsFields,
-                      QgsVectorFileWriter, QgsMessageLog)
+                      QgsVectorFileWriter, QgsMessageLog, QgsSpatialIndex)
 from qgis.utils import iface
 from datetime import datetime
 import processing
@@ -9,6 +9,9 @@ import re
 import os
 from .overlap_resolver_dialog import OverlapResolverDialog
 from .logger import PluginLogger
+from multiprocessing import Pool, cpu_count
+from functools import partial
+import math
 
 class OverlapResolver:
     def __init__(self, iface):
@@ -17,6 +20,7 @@ class OverlapResolver:
         self.input_layers = []
         self.datetime_fields = {}
         self.logger = PluginLogger("Overlap Resolver")
+        self.progress_dialog = None
         self.datetime_formats = [
             # Standard ISO formats
             "%Y-%m-%d %H:%M:%S",
@@ -178,6 +182,11 @@ class OverlapResolver:
             # Create a temporary layer for overlaps
             overlap_layer = self.detect_overlaps()
             
+            # Check if operation was cancelled
+            if overlap_layer is None:
+                self.logger.info("Operation cancelled by user")
+                return
+
             if not overlap_layer.isValid():
                 self.logger.error("Failed to create overlap layer")
                 QMessageBox.critical(None, "Error", "Failed to create overlap layer")
@@ -299,6 +308,64 @@ class OverlapResolver:
             self.logger.error(f"Error detecting datetime format for field {field_name}: {str(e)}")
             return None
 
+    def create_progress_dialog(self, title, label, maximum):
+        """Create and return a progress dialog"""
+        progress = QProgressDialog(label, "Cancel", 0, maximum, self.iface.mainWindow())
+        progress.setWindowTitle(title)
+        progress.setWindowModality(2)  # WindowModal
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(True)
+        progress.setAutoReset(True)
+        return progress
+
+    def process_feature_batch(self, batch_data):
+        """Process a batch of features in parallel"""
+        layer1_id, feature1_id, feature1_geom_wkt, spatial_indices_data, other_layers_data = batch_data
+        results = []
+        
+        # Convert WKT back to geometry
+        feature1_geom = QgsGeometry.fromWkt(feature1_geom_wkt)
+        feature1_bbox = feature1_geom.boundingBox()
+        
+        # Recreate spatial indices
+        spatial_indices = {}
+        for layer_id, index_data in spatial_indices_data.items():
+            index = QgsSpatialIndex()
+            for bbox in index_data:
+                index.insertFeature(QgsFeature(bbox['id']), bbox['bbox'])
+            spatial_indices[layer_id] = index
+        
+        for layer2_data in other_layers_data:
+            layer2_id = layer2_data['id']
+            potential_overlaps = spatial_indices[layer2_id].intersects(feature1_bbox)
+            
+            for fid in potential_overlaps:
+                # Skip same feature
+                if f"{layer1_id}_{feature1_id}" == f"{layer2_id}_{fid}":
+                    continue
+                
+                # Get feature2 geometry from the data
+                feature2_geom = QgsGeometry.fromWkt(layer2_data['features'][fid])
+                
+                if feature1_geom.intersects(feature2_geom):
+                    intersection = feature1_geom.intersection(feature2_geom)
+                    
+                    if not intersection.isEmpty():
+                        intersection_area = intersection.area()
+                        feature2_area = feature2_geom.area()
+                        
+                        results.append({
+                            'feature1_id': f"{layer1_id}_{feature1_id}",
+                            'feature2_id': f"{layer2_id}_{fid}",
+                            'layer2_id': layer2_id,
+                            'intersection_wkt': intersection.asWkt(),
+                            'intersection_area': intersection_area,
+                            'feature2_area': feature2_area,
+                            'is_subdivision': intersection_area > 0.95 * feature2_area
+                        })
+        
+        return results
+
     def detect_overlaps(self):
         """Detect overlapping areas between layers, considering survey progression"""
         try:
@@ -311,55 +378,157 @@ class OverlapResolver:
 
             # Dictionary to store overlapping features and their relationships
             self.overlapping_features = {}
-            self.feature_areas = {}  # Store areas for comparison
+            self.feature_areas = {}
 
-            # First pass: calculate areas and store feature information
+            # First pass: calculate areas and create spatial indices
+            total_features = sum(layer.featureCount() for layer in self.input_layers)
+            processed_features = 0
+            
+            progress = self.create_progress_dialog(
+                "Processing Features",
+                "Creating spatial indices...",
+                total_features
+            )
+
+            # Create spatial indices for each layer
+            spatial_indices = {}
+            layer_data = {}
+            
             for layer in self.input_layers:
+                # Create spatial index
+                index = QgsSpatialIndex()
+                layer_data[layer.id()] = {
+                    'id': layer.id(),
+                    'crs': layer.crs().authid(),
+                    'features': {}
+                }
+                
+                # Add features to spatial index and store data
                 for feature in layer.getFeatures():
+                    # Add to spatial index
+                    index.insertFeature(feature)
+                    
+                    # Store feature data
                     feature_id = f"{layer.id()}_{feature.id()}"
                     self.overlapping_features[feature_id] = []
                     self.feature_areas[feature_id] = feature.geometry().area()
-
-            # Second pass: detect overlaps and relationships
-            for i, layer1 in enumerate(self.input_layers):
-                for feature1 in layer1.getFeatures():
-                    feature1_id = f"{layer1.id()}_{feature1.id()}"
-                    feature1_geom = feature1.geometry()
                     
-                    # Check against all other layers
-                    for layer2 in self.input_layers:
-                        for feature2 in layer2.getFeatures():
-                            feature2_id = f"{layer2.id()}_{feature2.id()}"
-                            
+                    # Store feature data for processing
+                    layer_data[layer.id()]['features'][feature.id()] = {
+                        'id': feature.id(),
+                        'geometry': feature.geometry(),
+                        'attributes': feature.attributes()
+                    }
+                    
+                    processed_features += 1
+                    progress.setValue(processed_features)
+                    
+                    if progress.wasCanceled():
+                        progress.close()
+                        return None
+                
+                spatial_indices[layer.id()] = index
+
+            # Second pass: detect overlaps using spatial indices
+            processed_features = 0
+            all_results = []
+            
+            progress = self.create_progress_dialog(
+                "Detecting Overlaps",
+                "Processing features...",
+                total_features
+            )
+
+            # Process each layer
+            for layer1_id, layer1_data in layer_data.items():
+                index1 = spatial_indices[layer1_id]
+                
+                # Process each feature in the layer
+                for feature1_id, feature1_data in layer1_data['features'].items():
+                    feature1_geom = feature1_data['geometry']
+                    feature1_bbox = feature1_geom.boundingBox()
+                    
+                    # Get potential overlapping features using spatial index
+                    for layer2_id, layer2_data in layer_data.items():
+                        index2 = spatial_indices[layer2_id]
+                        
+                        # Get potential overlaps from spatial index
+                        potential_overlaps = index2.intersects(feature1_bbox)
+                        
+                        for fid in potential_overlaps:
                             # Skip same feature
-                            if feature1_id == feature2_id:
+                            if f"{layer1_id}_{feature1_id}" == f"{layer2_id}_{fid}":
                                 continue
-                                
-                            # Check for intersection
-                            if feature1_geom.intersects(feature2.geometry()):
-                                intersection = feature1_geom.intersection(feature2.geometry())
-                                
-                                if not intersection.isEmpty():
-                                    # Calculate intersection area
-                                    intersection_area = intersection.area()
-                                    feature1_area = self.feature_areas[feature1_id]
-                                    feature2_area = self.feature_areas[feature2_id]
+                            
+                            feature2_data = layer2_data['features'][fid]
+                            feature2_geom = feature2_data['geometry']
+                            
+                            # Quick check using bounding boxes
+                            if feature1_bbox.intersects(feature2_geom.boundingBox()):
+                                # Detailed check using actual geometries
+                                if feature1_geom.intersects(feature2_geom):
+                                    intersection = feature1_geom.intersection(feature2_geom)
                                     
-                                    # Store the relationship
-                                    self.overlapping_features[feature1_id].append({
-                                        'layer': layer2,
-                                        'feature': feature2,
-                                        'intersection_area': intersection_area,
-                                        'feature_area': feature2_area,
-                                        'is_subdivision': intersection_area > 0.95 * feature2_area  # If intersection covers most of feature2
-                                    })
-                                    
-                                    # Add to overlap layer
-                                    overlap_feature = QgsFeature()
-                                    overlap_feature.setGeometry(intersection)
-                                    overlap_layer.startEditing()
-                                    overlap_layer.addFeature(overlap_feature)
-                                    overlap_layer.commitChanges()
+                                    if not intersection.isEmpty():
+                                        intersection_area = intersection.area()
+                                        feature2_area = feature2_geom.area()
+                                        
+                                        # Only process if the intersection is significant
+                                        if intersection_area > 0.0001:  # Minimum area threshold
+                                            all_results.append({
+                                                'feature1_id': f"{layer1_id}_{feature1_id}",
+                                                'feature2_id': f"{layer2_id}_{fid}",
+                                                'layer2_id': layer2_id,
+                                                'intersection': intersection,
+                                                'intersection_area': intersection_area,
+                                                'feature2_area': feature2_area,
+                                                'is_subdivision': intersection_area > 0.95 * feature2_area
+                                            })
+                    
+                    processed_features += 1
+                    progress.setValue(processed_features)
+                    
+                    if progress.wasCanceled():
+                        progress.close()
+                        return None
+
+            # Process results in batches
+            batch_size = 100
+            for i in range(0, len(all_results), batch_size):
+                batch = all_results[i:i + batch_size]
+                
+                overlap_layer.startEditing()
+                for result in batch:
+                    feature1_id = result['feature1_id']
+                    feature2_id = result['feature2_id']
+                    
+                    # Find the actual layer and feature objects
+                    layer2 = next(layer for layer in self.input_layers if layer.id() == result['layer2_id'])
+                    
+                    # Handle both numeric and hexadecimal feature IDs
+                    try:
+                        # Try to convert to integer first
+                        feature2_fid = int(feature2_id.split('_')[1])
+                    except ValueError:
+                        # If that fails, use the ID as is
+                        feature2_fid = feature2_id.split('_')[1]
+                    
+                    feature2 = layer2.getFeature(feature2_fid)
+                    
+                    self.overlapping_features[feature1_id].append({
+                        'layer': layer2,
+                        'feature': feature2,
+                        'intersection_area': result['intersection_area'],
+                        'feature_area': result['feature2_area'],
+                        'is_subdivision': result['is_subdivision']
+                    })
+                    
+                    # Add to overlap layer
+                    overlap_feature = QgsFeature()
+                    overlap_feature.setGeometry(result['intersection'])
+                    overlap_layer.addFeature(overlap_feature)
+                
+                overlap_layer.commitChanges()
 
             return overlap_layer
         except Exception as e:
@@ -378,11 +547,68 @@ class OverlapResolver:
 
             resolution_method = self.dlg.get_resolution_method()
             
-            if resolution_method == "datetime":
-                self.resolve_by_datetime(output_layer)
-            else:
-                self.resolve_by_priority(output_layer)
+            # Process in batches
+            batch_size = 100
+            total_features = sum(layer.featureCount() for layer in self.input_layers)
+            processed_features = 0
             
+            progress = self.create_progress_dialog(
+                "Resolving Overlaps",
+                "Processing features...",
+                total_features
+            )
+
+            # First, create a layer to store all areas that should be removed
+            areas_to_remove = QgsVectorLayer("Polygon?crs=" + self.input_layers[0].crs().authid(),
+                                           "Areas_To_Remove", "memory")
+            
+            if not areas_to_remove.isValid():
+                raise Exception("Failed to create areas to remove layer")
+
+            # Process layers based on priority
+            if resolution_method == "datetime":
+                self.prepare_areas_to_remove_by_datetime(areas_to_remove, batch_size, total_features, processed_features, progress)
+            else:
+                self.prepare_areas_to_remove_by_priority(areas_to_remove, batch_size, total_features, processed_features, progress)
+            
+            if progress.wasCanceled():
+                return
+
+            # Now process each layer and remove the overlapping areas
+            progress = self.create_progress_dialog(
+                "Creating Final Layer",
+                "Removing overlaps and merging features...",
+                total_features
+            )
+
+            for layer in self.input_layers:
+                features = list(layer.getFeatures())
+                for feature in features:
+                    # Get the feature's geometry
+                    geom = feature.geometry()
+                    
+                    # Remove any areas that overlap with higher priority features
+                    if not geom.isEmpty():
+                        # Create a difference geometry by removing all overlapping areas
+                        diff_geom = geom
+                        for area_feature in areas_to_remove.getFeatures():
+                            diff_geom = diff_geom.difference(area_feature.geometry())
+                        
+                        # Only add the feature if it still has geometry after removing overlaps
+                        if not diff_geom.isEmpty():
+                            new_feature = QgsFeature()
+                            new_feature.setGeometry(diff_geom)
+                            new_feature.setAttributes(feature.attributes())
+                            output_layer.startEditing()
+                            output_layer.addFeature(new_feature)
+                            output_layer.commitChanges()
+                    
+                    processed_features += 1
+                    progress.setValue(processed_features)
+                    
+                    if progress.wasCanceled():
+                        return
+
             # Save output layer
             output_path = self.dlg.get_output_path()
             if not output_path:
@@ -413,60 +639,69 @@ class OverlapResolver:
             self.logger.critical(f"Error resolving overlaps: {str(e)}")
             self.logger.show_log_location()
 
-    def resolve_by_datetime(self, output_layer):
-        """Resolve overlaps using datetime values, considering survey progression"""
+    def prepare_areas_to_remove_by_datetime(self, areas_to_remove, batch_size, total_features, processed_features, progress):
+        """Prepare areas to remove based on datetime values"""
         try:
-            # Process each layer
+            # Sort layers by datetime (newest first)
+            sorted_layers = []
             for layer in self.input_layers:
                 layer_fields = self.datetime_fields.get(layer.id(), {})
-                if not layer_fields:
-                    self.logger.warning(f"No datetime fields found in layer: {layer.name()}")
-                    continue
-
-                # Use the first detected datetime field
-                datetime_field = next(iter(layer_fields))
-                datetime_format = layer_fields[datetime_field]
-                
-                for feature in layer.getFeatures():
-                    feature_id = f"{layer.id()}_{feature.id()}"
-                    overlaps = self.overlapping_features.get(feature_id, [])
-                    
-                    if not overlaps:
-                        # No overlaps, add feature as is
-                        output_layer.startEditing()
-                        output_layer.addFeature(feature)
-                        output_layer.commitChanges()
-                    else:
-                        # Get datetime for current feature
+                if layer_fields:
+                    datetime_field = next(iter(layer_fields))
+                    datetime_format = layer_fields[datetime_field]
+                    # Get the most recent datetime in the layer
+                    latest_time = datetime.min
+                    for feature in layer.getFeatures():
                         current_time = self.parse_datetime(feature[datetime_field], datetime_format)
+                        if current_time > latest_time:
+                            latest_time = current_time
+                    sorted_layers.append((layer, latest_time))
+                else:
+                    # If no datetime field, treat as oldest
+                    sorted_layers.append((layer, datetime.min))
+            
+            sorted_layers.sort(key=lambda x: x[1], reverse=True)
+            
+            # Process each layer in order of datetime
+            for i, (layer, _) in enumerate(sorted_layers):
+                # Skip the first (newest) layer as it has highest priority
+                if i == 0:
+                    continue
+                
+                # Get all features from higher priority layers
+                higher_priority_geoms = []
+                for higher_layer, _ in sorted_layers[:i]:
+                    for feature in higher_layer.getFeatures():
+                        higher_priority_geoms.append(feature.geometry())
+                
+                # For each feature in current layer
+                for feature in layer.getFeatures():
+                    geom = feature.geometry()
+                    
+                    # Find intersections with higher priority features
+                    for higher_geom in higher_priority_geoms:
+                        if geom.intersects(higher_geom):
+                            intersection = geom.intersection(higher_geom)
+                            if not intersection.isEmpty():
+                                # Add intersection to areas to remove
+                                remove_feature = QgsFeature()
+                                remove_feature.setGeometry(intersection)
+                                areas_to_remove.startEditing()
+                                areas_to_remove.addFeature(remove_feature)
+                                areas_to_remove.commitChanges()
+                    
+                    processed_features += 1
+                    progress.setValue(processed_features)
+                    
+                    if progress.wasCanceled():
+                        return
                         
-                        # Check if this feature should be kept
-                        should_keep = True
-                        for overlap_info in overlaps:
-                            overlap_layer = overlap_info['layer']
-                            overlap_feature = overlap_info['feature']
-                            overlap_time = self.parse_datetime(
-                                overlap_feature[datetime_field], 
-                                datetime_format
-                            )
-                            
-                            # If overlap is a subdivision and newer, don't keep this feature
-                            if (overlap_info['is_subdivision'] and 
-                                overlap_time > current_time):
-                                should_keep = False
-                                break
-                        
-                        if should_keep:
-                            output_layer.startEditing()
-                            output_layer.addFeature(feature)
-                            output_layer.commitChanges()
-                            
         except Exception as e:
-            self.logger.error(f"Error in resolve_by_datetime: {str(e)}")
+            self.logger.error(f"Error in prepare_areas_to_remove_by_datetime: {str(e)}")
             raise
 
-    def resolve_by_priority(self, output_layer):
-        """Resolve overlaps using layer priorities, considering survey progression"""
+    def prepare_areas_to_remove_by_priority(self, areas_to_remove, batch_size, total_features, processed_features, progress):
+        """Prepare areas to remove based on layer priorities"""
         try:
             priorities = self.dlg.get_layer_priorities()
             
@@ -474,37 +709,42 @@ class OverlapResolver:
             sorted_layers = sorted(self.input_layers, 
                                  key=lambda layer: priorities.get(layer.id(), float('inf')))
             
-            # Process layers in priority order
-            for layer in sorted_layers:
+            # Process each layer in order of priority
+            for i, layer in enumerate(sorted_layers):
+                # Skip the first (highest priority) layer
+                if i == 0:
+                    continue
+                
+                # Get all features from higher priority layers
+                higher_priority_geoms = []
+                for higher_layer in sorted_layers[:i]:
+                    for feature in higher_layer.getFeatures():
+                        higher_priority_geoms.append(feature.geometry())
+                
+                # For each feature in current layer
                 for feature in layer.getFeatures():
-                    feature_id = f"{layer.id()}_{feature.id()}"
-                    overlaps = self.overlapping_features.get(feature_id, [])
+                    geom = feature.geometry()
                     
-                    if not overlaps:
-                        # No overlaps, add feature as is
-                        output_layer.startEditing()
-                        output_layer.addFeature(feature)
-                        output_layer.commitChanges()
-                    else:
-                        # Check if this feature should be kept based on priority and subdivision status
-                        should_keep = True
-                        for overlap_info in overlaps:
-                            overlap_layer = overlap_info['layer']
-                            
-                            # If overlap is a subdivision and from a higher priority layer, don't keep this feature
-                            if (overlap_info['is_subdivision'] and 
-                                priorities.get(overlap_layer.id(), float('inf')) < 
-                                priorities.get(layer.id(), float('inf'))):
-                                should_keep = False
-                                break
+                    # Find intersections with higher priority features
+                    for higher_geom in higher_priority_geoms:
+                        if geom.intersects(higher_geom):
+                            intersection = geom.intersection(higher_geom)
+                            if not intersection.isEmpty():
+                                # Add intersection to areas to remove
+                                remove_feature = QgsFeature()
+                                remove_feature.setGeometry(intersection)
+                                areas_to_remove.startEditing()
+                                areas_to_remove.addFeature(remove_feature)
+                                areas_to_remove.commitChanges()
+                    
+                    processed_features += 1
+                    progress.setValue(processed_features)
+                    
+                    if progress.wasCanceled():
+                        return
                         
-                        if should_keep:
-                            output_layer.startEditing()
-                            output_layer.addFeature(feature)
-                            output_layer.commitChanges()
-                            
         except Exception as e:
-            self.logger.error(f"Error in resolve_by_priority: {str(e)}")
+            self.logger.error(f"Error in prepare_areas_to_remove_by_priority: {str(e)}")
             raise
 
     def parse_datetime(self, datetime_str, datetime_format):
